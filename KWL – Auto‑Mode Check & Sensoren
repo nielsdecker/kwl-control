@@ -1,0 +1,264 @@
+/**
+ * ============================================================================
+ * kwl control - step 1: auto mode check & sensor data collection
+ * ============================================================================
+ * 
+ * tasks:
+ * - check if auto mode and draft mode are correctly set
+ * - read all relevant sensor data from home assistant
+ * - validate completeness of sensor data
+ * - abort flow if conditions are not met
+ * 
+ * ============================================================================
+ */
+
+// ============================================================================
+// settings and base configuration
+// ============================================================================
+
+const states = global.get("homeassistant.homeSystem.states") || {};
+const settings = msg.settings || {};
+const DEBUG = settings.debug === true;
+
+// entity ids for home assistant sensors
+const CFG = {
+  topicBase: "nodered/maico",
+  
+  // environment sensors
+  season: "select.times_season",
+  dayWindow: "sensor.tod_state",
+  indoorTemp: "sensor.ht_nr_indoor_temperature",
+  outdoorTemp: "sensor.ht_nr_outdoor_temperature",
+  indoorRH: "sensor.ht_nr_indoor_humidity",
+  outdoorRH: "sensor.ht_nr_outdoor_humidity",
+  indoorAbsHum: "sensor.ht_nr_indoor_abs_humidity",
+  outdoorAbsHum: "sensor.ht_nr_outdoor_abs_humidity",
+  co2: "sensor.ht_nr_indoor_co2",
+  
+  // bathroom humidity (for shower mode)
+  bathroomHumidity1: "sensor.ht_aq_13_1_humidity",
+  bathroomHumidity2: "sensor.ht_so_2_1_humidity",
+  
+  // target values and limits
+  roomTempSet: "number.kwl_1_temperature_target",
+  roomTempMax: "number.kwl_1_temperature_max",
+  humidityMax: "number.kwl_1_humidity_high",
+  humidityMin: "number.kwl_1_humidity_low",
+  dewpointLimit: "number.kwl_1_temperature_cooling",
+  
+  // current kwl states
+  currentFanLevel: "select.kwl_1_ventilation_mode",
+  currentFlowRate: "number.kwl_1_flow_rate_default",
+  currentBypass: "switch.kwl_1_ventilation_bypass",
+  currentMode: "select.kwl_1_operating_mode",
+  filterAlarm: "sensor.kwl_1_filter_replacement",
+  priority: "select.kwl_1_priority",
+  
+  // control modes
+  autoMode: "switch.kwl_1_ventilation_bypass_auto",
+  draftMode: "switch.kwl_1_ventilation_draft"
+};
+
+// ============================================================================
+// helper functions for data conversion
+// ============================================================================
+
+// read value from home assistant state
+function get(id) {
+  return states[id]?.state ?? null;
+}
+
+// convert to number with fallback
+const toNum = (id, fallback = null) => {
+  const value = Number(get(id));
+  return Number.isFinite(value) ? value : fallback;
+};
+
+// convert to string with fallback
+const toStr = (id, fallback = "") => {
+  return String(get(id) ?? fallback);
+};
+
+// convert to boolean
+const toBool = (id, fallback = false) => {
+  const value = String(get(id) ?? "").toLowerCase();
+  if (["on", "1", "true", "open"].includes(value)) return true;
+  if (["off", "0", "false", "closed"].includes(value)) return false;
+  return fallback;
+};
+
+// ============================================================================
+// normalization functions
+// ============================================================================
+
+// normalize season value
+const normalizeSeason = (season) => {
+  const value = String(season || "").toLowerCase();
+  if (["winter"].includes(value)) return "winter";
+  if (["spring", "frühling", "fruehling"].includes(value)) return "spring";
+  if (["summer", "sommer"].includes(value)) return "summer";
+  if (["autumn", "fall", "herbst"].includes(value)) return "autumn";
+  return value;
+};
+
+// normalize day/night value
+const normalizeDay = (day) => {
+  return ["night", "nacht"].includes(String(day).toLowerCase()) ? "night" : "day";
+};
+
+// convert ventilation level from text to number (1-4)
+const mapVent = (vent) => {
+  const value = String(vent || "").toLowerCase();
+  if (["feuchteschutz"].includes(value)) return 1;
+  if (["reduziert"].includes(value)) return 2;
+  if (["nennlüftung"].includes(value)) return 3;
+  if (["intensiv"].includes(value)) return 4;
+  return Number(value) || 3;
+};
+
+// convert operating mode from text to internal
+const mapMode = (mode) => {
+  const value = String(mode || "").toLowerCase();
+  if (["manuell"].includes(value)) return "balanced";
+  if (["eco-zuluft"].includes(value)) return "supply_only";
+  if (["eco-abluft"].includes(value)) return "exhaust_only";
+  return "balanced";
+};
+
+// ============================================================================
+// collect sensor data
+// ============================================================================
+
+const data = {
+  // base configuration
+  topicBase: CFG.topicBase,
+  season: normalizeSeason(toStr(CFG.season)),
+  dayWindow: normalizeDay(toStr(CFG.dayWindow)),
+  
+  // temperatures
+  indoorTemp: toNum(CFG.indoorTemp),
+  outdoorTemp: toNum(CFG.outdoorTemp),
+  
+  // humidity (relative)
+  indoorRH: toNum(CFG.indoorRH),
+  outdoorRH: toNum(CFG.outdoorRH),
+  
+  // humidity (absolute)
+  indoorAbsHumidity: toNum(CFG.indoorAbsHum),
+  outdoorAbsHumidity: toNum(CFG.outdoorAbsHum),
+  
+  // air quality
+  co2: toNum(CFG.co2),
+  
+  // bathroom humidity
+  bathroom1RH: toNum(CFG.bathroomHumidity1),
+  bathroom2RH: toNum(CFG.bathroomHumidity2),
+  
+  // target values
+  roomTempSet: toNum(CFG.roomTempSet),
+  roomTempMax: toNum(CFG.roomTempMax),
+  humidityMax: toNum(CFG.humidityMax, 60),
+  humidityMin: toNum(CFG.humidityMin, 40),
+  dewpointLimitTemp: toNum(CFG.dewpointLimit, 9),
+  
+  // current kwl values
+  currentFanLevel: mapVent(toStr(CFG.currentFanLevel)),
+  currentFlowRate: toNum(CFG.currentFlowRate, 150),
+  currentBypass: toBool(CFG.currentBypass, false),
+  currentMode: mapMode(toStr(CFG.currentMode, "balanced")),
+  filterAlarm: toBool(CFG.filterAlarm, false),
+  
+  // control
+  autoMode: toBool(CFG.autoMode, true),
+  draftMode: toBool(CFG.draftMode, false),
+  priority: toStr(CFG.priority, "Ohne")
+};
+
+// ============================================================================
+// auto mode check
+// ============================================================================
+
+// check if auto mode is active
+if (!data.autoMode) {
+  node.status({fill: "grey", shape: "dot", text: "auto mode off"});
+  if (DEBUG) {
+    node.warn("flow stopped: auto mode is disabled");
+  }
+  return null;
+}
+
+// check if draft mode is inactive
+if (data.draftMode) {
+  node.status({fill: "grey", shape: "dot", text: "draft mode on"});
+  if (DEBUG) {
+    node.warn("flow stopped: draft mode is enabled");
+  }
+  return null;
+}
+
+// ============================================================================
+// sensor data validation
+// ============================================================================
+
+// list of mandatory sensors
+const requiredSensors = [
+  "season",
+  "dayWindow",
+  "indoorTemp",
+  "outdoorTemp",
+  "indoorRH",
+  "indoorAbsHumidity",
+  "outdoorAbsHumidity",
+  "co2",
+  "roomTempSet",
+  "roomTempMax"
+];
+
+// check for missing values
+const missingSensors = requiredSensors.filter(key => {
+  return !data[key] && data[key] !== 0;
+});
+
+data.sensorOk = missingSensors.length === 0;
+
+// ============================================================================
+// debug output
+// ============================================================================
+
+if (DEBUG && missingSensors.length > 0) {
+  node.warn(`missing sensor data: ${missingSensors.join(", ")}`);
+}
+
+node.status({
+  fill: "green",
+  shape: "dot",
+  text: `sensors ok | ${data.dayWindow}`
+});
+
+if (DEBUG && data.sensorOk) {
+  node.warn(
+    `collected data: ` +
+    `indoor ${data.indoorTemp}°C / ${data.indoorRH}% | ` +
+    `outdoor ${data.outdoorTemp}°C | ` +
+    `co₂ ${data.co2}ppm`
+  );
+}
+
+// ============================================================================
+// add metadata
+// ============================================================================
+
+data._meta = {
+  missing: missingSensors,
+  timestamp: new Date().toISOString()
+};
+
+// ============================================================================
+// prepare output
+// ============================================================================
+
+msg.payload = data;
+msg.settings = settings;
+msg.debug = "auto+collect";
+
+return msg;
