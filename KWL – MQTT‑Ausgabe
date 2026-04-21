@@ -1,0 +1,125 @@
+/**
+ * ============================================================================
+ * kwl control - step 3: mqtt output
+ * ============================================================================
+ * 
+ * tasks:
+ * - send commands to mqtt broker
+ * - handle bus temperature if applicable
+ * - publish decision summary for monitoring
+ * - provide debug output
+ * 
+ * ============================================================================
+ */
+
+// ============================================================================
+// initialization
+// ============================================================================
+
+const p = msg.payload || {};
+const settings = msg.settings || {};
+const DEBUG = settings.debug === true;
+const topicBase = p.input?.topicBase || "nodered/maico";
+const out = [];
+
+// ============================================================================
+// send commands
+// ============================================================================
+
+for (const c of (p.commands || [])) {
+  out.push({
+    topic: c.topic,
+    payload: c.payload,
+    retain: true,
+    debug: "send_mqtt"
+  });
+  
+  if (DEBUG) {
+    node.warn(`mqtt → ${c.topic}: ${c.payload}`);
+  }
+}
+
+// ============================================================================
+// bus temperature (if applicable)
+// ============================================================================
+
+let busTemp = undefined;
+
+try {
+  const haStates = Object.values(global.get("homeassistant.homeSystem.states") || {});
+  const busData = haStates.reduce((acc, s) => {
+    if (s.entity_id === "select.kwl_1_temperature_mode" ||
+        s.entity_id === "sensor.kwl_1_room_temperature_bus") {
+      acc[s.entity_id.split(".")[1]] = s.state;
+    }
+    return acc;
+  }, {});
+  
+  // only in bus mode → create additional mqtt message
+  if (busData.kwl_1_temperature_mode === "BUS") {
+    const tempValue = parseFloat(busData.kwl_1_room_temperature_bus);
+    if (Number.isFinite(tempValue)) {
+      busTemp = {
+        topic: "nodered/maico/kwl_1_room_temperature_bus/cmd",
+        payload: tempValue,
+        retain: true,
+        debug: "send_mqtt_bus_temp"
+      };
+      
+      if (DEBUG) {
+        node.warn(`mqtt bus temp → ${tempValue}°C`);
+      }
+    }
+  }
+} catch (err) {
+  if (DEBUG) {
+    node.warn("bus temperature message skipped: " + err.message);
+  }
+}
+
+// ============================================================================
+// decision summary for monitoring
+// ============================================================================
+
+out.push({
+  topic: `${topicBase}/decision`,
+  payload: {
+    timestamp: new Date().toISOString(),
+    targetLevel: p.targetLevel,
+    targetFlowRate: p.targetFlowRate,
+    useFlowRate: p.useFlowRate,
+    targetBypass: p.targetBypass,
+    targetMode: p.targetMode,
+    score: p.score,
+    priority: p.priority,
+    reason: p.reason,
+    co2: p.input?.co2,
+    co2Trend: p.co2Trend,
+    indoorTemp: p.input?.indoorTemp,
+    outdoorTemp: p.input?.outdoorTemp,
+    indoorRH: p.input?.indoorRH,
+    hysteresis: p.hysteresis,
+    shower: p.shower
+  },
+  retain: true,
+  debug: "send_mqtt_decision"
+});
+
+// ============================================================================
+// debug status update
+// ============================================================================
+
+const totalMessages = out.length + (busTemp ? 1 : 0);
+node.status({
+  fill: "green",
+  shape: "dot",
+  text: `sent ${totalMessages} mqtt message(s)`
+});
+
+// ============================================================================
+// return outputs
+// ============================================================================
+
+// output 1: regular mqtt messages (array)
+// output 2: bus temperature message (single or undefined)
+return [out, busTemp];
