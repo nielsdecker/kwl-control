@@ -1,0 +1,996 @@
+/**
+ * ============================================================================
+ * kwl control - step 2: core decision logic
+ * ============================================================================
+ * 
+ * tasks:
+ * - analyze sensor data and calculate ventilation requirements
+ * - detect special conditions (shower mode, night cooling, etc.)
+ * - calculate score-based ventilation level/flow rate
+ * - apply priority adjustments from home assistant
+ * - enforce night limits and step limiting
+ * - determine bypass and operating mode
+ * - build commands with change interval protection
+ * 
+ * ============================================================================
+ */
+
+// ============================================================================
+// initialization and base variables
+// ============================================================================
+
+const d = msg.payload || {};
+const settings = msg.settings || {};
+const DEBUG = settings.debug === true;
+const USE_FLOW_RATE = settings.flowRate?.enabled === true;
+
+const now = Date.now();
+const topicBase = d.topicBase || "nodered/maico";
+const minRuntimeMs = (settings.minRuntimeMinutes || 20) * 60 * 1000;
+const priority = (d.priority || "Ohne").toLowerCase();
+
+// ============================================================================
+// extract settings with defaults
+// ============================================================================
+
+const cfg = {
+  // flow rate settings
+  flowRate: {
+    enabled: settings.flowRate?.enabled ?? false,
+    min: settings.flowRate?.min ?? 80,
+    max: settings.flowRate?.max ?? 300,
+    step: settings.flowRate?.step ?? 5,
+    maxStepPerCycle: settings.flowRate?.maxStepPerCycle ?? 20,
+    scoreMultiplier: settings.flowRate?.scoreMultiplier ?? 55
+  },
+  
+  // co2 settings
+  co2: {
+    trendRisingThreshold: settings.co2?.trendRisingThreshold ?? 30,
+    trendFallingThreshold: settings.co2?.trendFallingThreshold ?? -20,
+    highThreshold: settings.co2?.highThreshold ?? 1100,
+    highWithTrendThreshold: settings.co2?.highWithTrendThreshold ?? 900,
+    criticalThreshold: settings.co2?.criticalThreshold ?? 1300,
+    baseValue: settings.co2?.baseValue ?? 800,
+    rangeValue: settings.co2?.rangeValue ?? 700
+  },
+  
+  // temperature settings
+  temperature: {
+    outsideDeltaCooler: settings.temperature?.outsideDeltaCooler ?? 1,
+    outsideDeltaWarmer: settings.temperature?.outsideDeltaWarmer ?? 1,
+    hysteresisBand: settings.temperature?.hysteresisBand ?? 0.3,
+    nightCoolingMinDelta: settings.temperature?.nightCoolingMinDelta ?? 2,
+    nightCoolingStrongDelta: settings.temperature?.nightCoolingStrongDelta ?? 3,
+    nightCoolingSeasons: settings.temperature?.nightCoolingSeasons ?? ["spring", "summer"]
+  },
+  
+  // humidity settings
+  humidity: {
+    hysteresisBand: settings.humidity?.hysteresisBand ?? 2
+  },
+  
+  // score weights
+  scoreWeights: {
+    air: settings.scoreWeights?.air ?? 1.0,
+    humidityHigh: settings.scoreWeights?.humidityHigh ?? 0.6,
+    humidityLow: settings.scoreWeights?.humidityLow ?? 0.4,
+    tempMax: settings.scoreWeights?.tempMax ?? 0.5,
+    tempMin: settings.scoreWeights?.tempMin ?? 0.3
+  },
+  
+  // priority adjustments
+  priorityAdjustments: {
+    airQuality: settings.priorityAdjustments?.airQuality ?? 0.3,
+    tempHigh: settings.priorityAdjustments?.tempHigh ?? -0.3,
+    tempLow: settings.priorityAdjustments?.tempLow ?? 0.4,
+    humidityHigh: settings.priorityAdjustments?.humidityHigh ?? -0.3,
+    humidityLow: settings.priorityAdjustments?.humidityLow ?? 0.3,
+    quiet: settings.priorityAdjustments?.quiet ?? 0.8,
+    dayBias: settings.priorityAdjustments?.dayBias ?? 0.3,
+    nightBias: settings.priorityAdjustments?.nightBias ?? -0.2
+  },
+  
+  // boost amounts
+  boosts: {
+    co2High: settings.boosts?.co2High ?? 40,
+    co2Falling: settings.boosts?.co2Falling ?? -30,
+    dehumidify: settings.boosts?.dehumidify ?? 35,
+    nightCoolStrong: settings.boosts?.nightCoolStrong ?? 60,
+    nightCoolMedium: settings.boosts?.nightCoolMedium ?? 40,
+    nightCoolSoft: settings.boosts?.nightCoolSoft ?? 20,
+    tempHighReduction: settings.boosts?.tempHighReduction ?? 40,
+    tempLowIncrease: settings.boosts?.tempLowIncrease ?? 50
+  },
+  
+  // shower mode
+  showerMode: {
+    enabled: settings.showerMode?.enabled ?? true,
+    humidityThresholdMild: settings.showerMode?.humidityThresholdMild ?? 10,
+    humidityThresholdStrong: settings.showerMode?.humidityThresholdStrong ?? 20,
+    humidityFallingThreshold: settings.showerMode?.humidityFallingThreshold ?? -5,
+    boostMild: settings.showerMode?.boostMild ?? 30,
+    boostStrong: settings.showerMode?.boostStrong ?? 60
+  },
+  
+  // night limits
+  night: {
+    maxLevel: settings.nightMaxLevel ?? 3,
+    maxFlowRate: settings.nightMaxFlowRate ?? 225
+  }
+};
+
+// ============================================================================
+// helper functions
+// ============================================================================
+
+// get persistent flag from global context
+function getFlag(key) {
+  return global.get(key) === true;
+}
+
+// set persistent flag in global context
+function setFlag(key, value) {
+  global.set(key, !!value);
+}
+
+// convert flow rate to ventilation level (1-4)
+function flowRateToLevel(flowRate) {
+  if (flowRate < 120) return 1;
+  if (flowRate < 175) return 2;
+  if (flowRate < 225) return 3;
+  return 4;
+}
+
+// convert ventilation level to representative flow rate
+function levelToFlowRate(level) {
+  const map = {1: 100, 2: 150, 3: 200, 4: 275};
+  return map[level] || 150;
+}
+
+// cap flow rate to valid range and step
+function capFlowRate(flowRate) {
+  const min = cfg.flowRate.min;
+  const max = cfg.flowRate.max;
+  const step = cfg.flowRate.step;
+  let capped = Math.max(min, Math.min(max, flowRate));
+  return Math.round(capped / step) * step;
+}
+
+// limit flow rate change per cycle (smooth transitions)
+function applyMaxStepLimit(currentFR, targetFR, isEmergency = false) {
+  const maxStep = cfg.flowRate.maxStepPerCycle;
+  
+  if (isEmergency) {
+    if (DEBUG) {
+      node.warn(`emergency mode: allowing full step ${currentFR} → ${targetFR}`);
+    }
+    return targetFR;
+  }
+  
+  const delta = targetFR - currentFR;
+  
+  if (Math.abs(delta) <= maxStep) {
+    return targetFR;
+  }
+  
+  const limitedFR = delta > 0 ? currentFR + maxStep : currentFR - maxStep;
+  
+  if (DEBUG) {
+    node.warn(
+      `flow rate step limited: ${currentFR} → ${targetFR} ` +
+      `(capped to ${limitedFR}, Δ=${delta > 0 ? '+' : ''}${Math.abs(delta)} > max ${maxStep})`
+    );
+  }
+  
+  return capFlowRate(limitedFR);
+}
+
+// ============================================================================
+// persistent hysteresis flags
+// ============================================================================
+
+let coolingActive = getFlag("state.maico.kwl_cooling_active");
+let dehumidifyActive = getFlag("state.maico.kwl_dehumidify_active");
+let nightCoolingActive = getFlag("state.maico.kwl_night_cooling_active");
+
+// ============================================================================
+// sensor data validation
+// ============================================================================
+
+if (!d.sensorOk) {
+  if (DEBUG) {
+    node.warn("fallback: missing sensor data");
+  }
+  return {
+    payload: {
+      targetLevel: 3,
+      targetFlowRate: 200,
+      targetBypass: 0,
+      targetMode: "balanced",
+      reason: ["fallback_sensor"],
+      input: d
+    }
+  };
+}
+
+// ============================================================================
+// basic environmental states
+// ============================================================================
+
+const isNight = d.dayWindow === "night";
+const tempAboveSet = d.indoorTemp > d.roomTempSet;
+const tempAboveMax = d.indoorTemp > d.roomTempMax;
+const outsideCooler = d.outdoorTemp <= d.indoorTemp - cfg.temperature.outsideDeltaCooler;
+const outsideWarmer = d.outdoorTemp >= d.indoorTemp + cfg.temperature.outsideDeltaWarmer;
+const deltaT = d.indoorTemp - d.outdoorTemp;
+
+if (DEBUG) {
+  node.warn(
+    `basic states: night=${isNight} | ΔT=${deltaT.toFixed(1)}°C | ` +
+    `outside ${outsideCooler ? "cooler" : outsideWarmer ? "warmer" : "similar"}`
+  );
+}
+
+// ============================================================================
+// co₂ trend analysis
+// ============================================================================
+
+const prevCo2 = flow.get("maico.kwl_prev_co2") ?? d.co2;
+const co2Trend = d.co2 - prevCo2;
+flow.set("maico.kwl_prev_co2", d.co2);
+
+const co2Rising = co2Trend > cfg.co2.trendRisingThreshold;
+const co2Falling = co2Trend < cfg.co2.trendFallingThreshold;
+let co2High = d.co2 >= cfg.co2.highThreshold || 
+              (d.co2 >= cfg.co2.highWithTrendThreshold && co2Rising);
+let co2Critical = d.co2 >= cfg.co2.criticalThreshold;
+
+if (DEBUG && Math.abs(co2Trend) > 20) {
+  node.warn(
+    `co₂ trend: ${co2Trend > 0 ? '+' : ''}${co2Trend}ppm ` +
+    `(${co2Rising ? 'rising' : co2Falling ? 'falling' : 'stable'})`
+  );
+}
+
+// ============================================================================
+// shower mode - bathroom humidity spike detection
+// ============================================================================
+
+const showerCfg = cfg.showerMode;
+const showerEnabled = showerCfg.enabled;
+
+let showerBoost = 0;
+let showerActive = false;
+const showerReasons = [];
+
+if (showerEnabled && d.bathroom1RH && d.bathroom2RH) {
+  
+  const prevBath1 = flow.get("maico.kwl_prev_bath1_rh") ?? d.bathroom1RH;
+  const prevBath2 = flow.get("maico.kwl_prev_bath2_rh") ?? d.bathroom2RH;
+  
+  const bath1Delta = d.bathroom1RH - prevBath1;
+  const bath2Delta = d.bathroom2RH - prevBath2;
+  
+  flow.set("maico.kwl_prev_bath1_rh", d.bathroom1RH);
+  flow.set("maico.kwl_prev_bath2_rh", d.bathroom2RH);
+  
+  const thresholdMild = showerCfg.humidityThresholdMild;
+  const thresholdStrong = showerCfg.humidityThresholdStrong;
+  const thresholdFalling = showerCfg.humidityFallingThreshold;
+  const boostMild = showerCfg.boostMild;
+  const boostStrong = showerCfg.boostStrong;
+  
+  const maxDelta = Math.max(bath1Delta, bath2Delta);
+  const spikingBathroom = bath1Delta > bath2Delta ? "bath1" : "bath2";
+  const spikingValue = Math.max(bath1Delta, bath2Delta);
+  
+  if (maxDelta >= thresholdStrong) {
+    showerBoost = boostStrong;
+    showerActive = true;
+    showerReasons.push(`${spikingBathroom}_spike_+${spikingValue.toFixed(1)}%_STRONG`);
+    if (DEBUG) {
+      node.warn(
+        `🚿 shower detected (strong): ${spikingBathroom} ` +
+        `+${spikingValue.toFixed(1)}% → boost +${boostStrong}`
+      );
+    }
+  } else if (maxDelta >= thresholdMild) {
+    showerBoost = boostMild;
+    showerActive = true;
+    showerReasons.push(`${spikingBathroom}_spike_+${spikingValue.toFixed(1)}%_mild`);
+    if (DEBUG) {
+      node.warn(
+        `🚿 shower detected (mild): ${spikingBathroom} ` +
+        `+${spikingValue.toFixed(1)}% → boost +${boostMild}`
+      );
+    }
+  } else if (maxDelta < thresholdFalling) {
+    const wasActive = flow.get("maico.kwl_shower_was_active") === true;
+    if (wasActive && DEBUG) {
+      node.warn(`🚿 shower ended: ${spikingBathroom} ${spikingValue.toFixed(1)}%`);
+    }
+  }
+  
+  flow.set("maico.kwl_shower_was_active", showerActive);
+  
+  if (DEBUG && (Math.abs(bath1Delta) > 3 || Math.abs(bath2Delta) > 3)) {
+    node.warn(
+      `bathroom humidity: ` +
+      `bath1 ${bath1Delta > 0 ? '+' : ''}${bath1Delta.toFixed(1)}% (${d.bathroom1RH}%) | ` +
+      `bath2 ${bath2Delta > 0 ? '+' : ''}${bath2Delta.toFixed(1)}% (${d.bathroom2RH}%)`
+    );
+  }
+}
+
+// ============================================================================
+// hysteresis state updates
+// ============================================================================
+
+const prevCooling = coolingActive;
+const prevDehumid = dehumidifyActive;
+const prevNightCool = nightCoolingActive;
+
+const tempHysteresis = cfg.temperature.hysteresisBand;
+const humidityHysteresis = cfg.humidity.hysteresisBand;
+
+if (!coolingActive && d.indoorTemp > d.roomTempMax + tempHysteresis) {
+  coolingActive = true;
+}
+if (coolingActive && d.indoorTemp < d.roomTempMax - tempHysteresis) {
+  coolingActive = false;
+}
+
+if (!dehumidifyActive && d.indoorRH > d.humidityMax + humidityHysteresis && 
+    d.indoorAbsHumidity > d.outdoorAbsHumidity) {
+  dehumidifyActive = true;
+}
+if (dehumidifyActive && d.indoorRH < d.humidityMax - humidityHysteresis) {
+  dehumidifyActive = false;
+}
+
+// night cooling - season-dependent activation
+const nightCoolingAllowedSeasons = cfg.temperature.nightCoolingSeasons || ["spring", "summer"];
+const nightCoolingSeasonOk = nightCoolingAllowedSeasons.includes(d.season);
+
+if (!nightCoolingActive && isNight && nightCoolingSeasonOk &&
+    deltaT >= cfg.temperature.nightCoolingMinDelta && 
+    d.outdoorTemp >= d.dewpointLimitTemp) {
+  nightCoolingActive = true;
+}
+if (nightCoolingActive && 
+    (!isNight || !nightCoolingSeasonOk || deltaT < 1 || d.outdoorTemp < d.dewpointLimitTemp)) {
+  nightCoolingActive = false;
+}
+
+setFlag("state.maico.kwl_cooling_active", coolingActive);
+setFlag("state.maico.kwl_dehumidify_active", dehumidifyActive);
+setFlag("state.maico.kwl_night_cooling_active", nightCoolingActive);
+
+if (DEBUG) {
+  if (prevCooling !== coolingActive) {
+    node.warn(`cooling mode: ${coolingActive ? 'activated' : 'deactivated'}`);
+  }
+  if (prevDehumid !== dehumidifyActive) {
+    node.warn(`dehumidify mode: ${dehumidifyActive ? 'activated' : 'deactivated'}`);
+  }
+  if (prevNightCool !== nightCoolingActive) {
+    node.warn(`night cooling: ${nightCoolingActive ? 'activated' : 'deactivated'}`);
+  }
+  if (isNight && !nightCoolingSeasonOk && deltaT >= 2) {
+    node.warn(`night cooling blocked: season=${d.season} (allowed: ${nightCoolingAllowedSeasons.join(", ")})`);
+  }
+}
+
+
+// ============================================================================
+// soft score system (multi-factor weighted calculation)
+// ============================================================================
+
+const wAir = cfg.scoreWeights.air;
+const wHumHigh = cfg.scoreWeights.humidityHigh;
+const wHumLow = cfg.scoreWeights.humidityLow;
+const wTmax = cfg.scoreWeights.tempMax;
+const wTmin = cfg.scoreWeights.tempMin;
+
+const air = Math.max(0, (d.co2 - cfg.co2.baseValue) / cfg.co2.rangeValue) * wAir;
+const humHigh = Math.max(0, (d.indoorRH - d.humidityMax) / 10) * wHumHigh;
+const humLow = Math.max(0, (d.humidityMin - d.indoorRH) / 10) * wHumLow;
+const tHigh = Math.max(0, (d.indoorTemp - d.roomTempMax) / 2) * wTmax;
+const tLow = Math.max(0, (d.roomTempSet - d.indoorTemp) / 2) * wTmin;
+
+let scoreBase = 1+ air + humHigh + humLow + tHigh + tLow;
+
+if (DEBUG) {
+  node.warn(
+    `score components: ` +
+    `air=${air.toFixed(2)} | ` +
+    `humHigh=${humHigh.toFixed(2)} | ` +
+    `humLow=${humLow.toFixed(2)} | ` +
+    `tHigh=${tHigh.toFixed(2)} | ` +
+    `tLow=${tLow.toFixed(2)} | ` +
+    `base=${scoreBase.toFixed(2)}`
+  );
+}
+
+let score = scoreBase;
+
+// ============================================================================
+// priority adjustments (from home assistant)
+// ============================================================================
+
+const priorityAdjustments = [];
+
+switch (priority) {
+  case "luftqualität":
+    score += cfg.priorityAdjustments.airQuality * air;
+    priorityAdjustments.push(
+      `+air(${(cfg.priorityAdjustments.airQuality * air).toFixed(2)})`
+    );
+    break;
+    
+  case "temperatur hoch":
+    score += cfg.priorityAdjustments.tempHigh;
+    priorityAdjustments.push(`${cfg.priorityAdjustments.tempHigh}(keep warm)`);
+    break;
+    
+  case "temperatur runter":
+    if (outsideCooler) {
+      score += cfg.priorityAdjustments.tempLow;
+      priorityAdjustments.push(`+${cfg.priorityAdjustments.tempLow}(cool down)`);
+    }
+    break;
+    
+  case "feuchtigkeit hoch":
+    score += cfg.priorityAdjustments.humidityHigh * humLow;
+    priorityAdjustments.push(
+      `${cfg.priorityAdjustments.humidityHigh < 0 ? '' : '+'}humLow(${(cfg.priorityAdjustments.humidityHigh * humLow).toFixed(2)})`
+    );
+    break;
+    
+  case "feuchtigkeit runter":
+    score += cfg.priorityAdjustments.humidityLow * humHigh;
+    priorityAdjustments.push(
+      `+humHigh(${(cfg.priorityAdjustments.humidityLow * humHigh).toFixed(2)})`
+    );
+    break;
+    
+  case "lautstärke":
+    score *= cfg.priorityAdjustments.quiet;
+    priorityAdjustments.push(`*${cfg.priorityAdjustments.quiet}(quiet)`);
+    break;
+}
+
+if (!isNight) {
+  score += cfg.priorityAdjustments.dayBias;
+  priorityAdjustments.push(`+${cfg.priorityAdjustments.dayBias}(day)`);
+} else {
+  score += cfg.priorityAdjustments.nightBias;
+  priorityAdjustments.push(`${cfg.priorityAdjustments.nightBias}(night)`);
+}
+
+if (DEBUG && priorityAdjustments.length > 0) {
+  node.warn(
+    `priority adjustments [${priority}]: ` +
+    `${priorityAdjustments.join(", ")} → score=${score.toFixed(2)}`
+  );
+}
+
+// ============================================================================
+// score to initial target values
+// ============================================================================
+
+let targetLevel;
+let targetFlowRate;
+let isEmergency = false;
+
+const currentFlowRate = USE_FLOW_RATE 
+  ? (flow.get("maico.kwl_applied")?.flowRate || 150)
+  : levelToFlowRate(flow.get("maico.kwl_applied")?.level || 3);
+
+if (USE_FLOW_RATE) {
+  let baseFlowRate = cfg.flowRate.min + (score * cfg.flowRate.scoreMultiplier);
+  let desiredFlowRate = capFlowRate(baseFlowRate);
+  
+  if (DEBUG) {
+    node.warn(
+      `score ${score.toFixed(2)} → desired flow rate ${desiredFlowRate} ` +
+      `(current: ${currentFlowRate})`
+    );
+  }
+  
+  targetFlowRate = desiredFlowRate;
+  targetLevel = flowRateToLevel(targetFlowRate);
+  
+} else {
+  targetLevel = score < 0.25 ? 1 : score < 1.0 ? 2 : score < 2.0 ? 3 : 4;
+  targetFlowRate = levelToFlowRate(targetLevel);
+  
+  if (DEBUG) {
+    node.warn(
+      `score ${score.toFixed(2)} → level ${targetLevel} ` +
+      `(equivalent to flow rate ${targetFlowRate})`
+    );
+  }
+}
+
+let targetBypass = 0;
+let targetMode = "balanced";
+const reason = [`score=${score.toFixed(2)}`, `priority=${priority}`];
+
+// ============================================================================
+// extended logic with boost system
+// ============================================================================
+
+let boostAmount = 0;
+const boostReasons = [];
+
+// shower mode boost (high priority - before co₂ critical check)
+if (showerBoost > 0) {
+  if (USE_FLOW_RATE) {
+    boostAmount += showerBoost;
+    boostReasons.push(`+${showerBoost}(shower)`);
+  } else {
+    if (showerBoost >= cfg.showerMode.boostStrong) {
+      targetLevel = 4;
+      boostReasons.push("shower_strong_L4");
+    } else {
+      targetLevel = Math.max(targetLevel, 3);
+      boostReasons.push("shower_mild_L3");
+    }
+  }
+  reason.push(...showerReasons);
+}
+
+// co₂ critical - emergency override (ignore step limit)
+if (co2Critical) {
+  isEmergency = true;
+  if (USE_FLOW_RATE) {
+    targetFlowRate = capFlowRate(cfg.flowRate.max);
+  } else {
+    targetLevel = 4;
+  }
+  boostReasons.push("co2_critical_EMERGENCY");
+  reason.push("EMERGENCY");
+  
+} else {
+  
+  // co₂ high - add boost
+  if (co2High) {
+    if (USE_FLOW_RATE) {
+      boostAmount += cfg.boosts.co2High;
+      boostReasons.push(`+${cfg.boosts.co2High}(co2_high)`);
+    } else {
+      targetLevel = Math.max(targetLevel, 3);
+    }
+  }
+  
+  // co₂ falling - reduce
+  if (co2Falling && d.co2 < 900) {
+    if (USE_FLOW_RATE) {
+      boostAmount += cfg.boosts.co2Falling;
+      boostReasons.push(`${cfg.boosts.co2Falling}(co2_falling)`);
+    } else {
+      targetLevel = Math.min(targetLevel, 2);
+    }
+  }
+  
+  // dehumidify active - add boost
+  if (dehumidifyActive) {
+    if (USE_FLOW_RATE) {
+      boostAmount += cfg.boosts.dehumidify;
+      boostReasons.push(`+${cfg.boosts.dehumidify}(dehumidify)`);
+    } else {
+      targetLevel = Math.max(targetLevel, 3);
+    }
+  }
+  
+  // night cooling - add boost based on intensity
+  if (isNight && nightCoolingActive) {
+    targetBypass = 1;
+    if (deltaT >= cfg.temperature.nightCoolingStrongDelta && d.co2 > 1200) {
+      if (USE_FLOW_RATE) {
+        boostAmount += cfg.boosts.nightCoolStrong;
+        boostReasons.push(`+${cfg.boosts.nightCoolStrong}(night_cool_strong)`);
+      } else {
+        targetLevel = Math.min(4, cfg.night.maxLevel);
+      }
+    } else if (deltaT >= cfg.temperature.nightCoolingMinDelta) {
+      if (USE_FLOW_RATE) {
+        boostAmount += cfg.boosts.nightCoolMedium;
+        boostReasons.push(`+${cfg.boosts.nightCoolMedium}(night_cool_med)`);
+      } else {
+        targetLevel = Math.max(targetLevel, 3);
+      }
+    } else {
+      if (USE_FLOW_RATE) {
+        boostAmount += cfg.boosts.nightCoolSoft;
+        boostReasons.push(`+${cfg.boosts.nightCoolSoft}(night_cool_soft)`);
+      } else {
+        targetLevel = Math.max(targetLevel, 2);
+      }
+    }
+  }
+}
+
+// apply boost to flow rate
+if (USE_FLOW_RATE && boostAmount !== 0) {
+  const beforeBoost = targetFlowRate;
+  targetFlowRate = capFlowRate(targetFlowRate + boostAmount);
+  if (DEBUG) {
+    node.warn(
+      `flow rate boost: ${beforeBoost} ${boostAmount > 0 ? '+' : ''}${boostAmount} = ` +
+      `${targetFlowRate} [${boostReasons.join(", ")}]`
+    );
+  }
+  reason.push(...boostReasons);
+}
+
+// update level/flowrate sync
+if (USE_FLOW_RATE) {
+  targetLevel = flowRateToLevel(targetFlowRate);
+} else {
+  targetFlowRate = levelToFlowRate(targetLevel);
+}
+
+// ============================================================================
+// temperature priority specific logic
+// ============================================================================
+
+if (priority === "temperatur hoch") {
+  if (outsideCooler) {
+    targetBypass = 0;
+    if (USE_FLOW_RATE) {
+      const reduction = Math.min(cfg.boosts.tempHighReduction, targetFlowRate - cfg.flowRate.min);
+      targetFlowRate = capFlowRate(targetFlowRate - reduction);
+      if (DEBUG && reduction > 0) {
+        node.warn(`temp priority: reduce ventilation -${reduction} to keep warmth`);
+      }
+      if (reduction > 0) {
+        boostReasons.push(`-${reduction}(keep_warm)`);
+      }
+    } else {
+      targetLevel = Math.min(targetLevel, 2);
+    }
+    reason.push("temp_high_keep_warm");
+  } else if (outsideWarmer && d.season === "summer") {
+    targetMode = "supply_only";
+    reason.push("temp_high_import_warmth");
+  }
+}
+
+if (priority === "temperatur runter") {
+  if (outsideCooler) {
+    targetBypass = 1;
+    if (USE_FLOW_RATE) {
+      const boost = cfg.boosts.tempLowIncrease;
+      targetFlowRate = capFlowRate(targetFlowRate + boost);
+      if (DEBUG) {
+        node.warn(`temp priority: increase ventilation +${boost} to cool down`);
+      }
+      boostReasons.push(`+${boost}(cool_down)`);
+    } else {
+      targetLevel = Math.max(targetLevel, 3);
+    }
+    reason.push("temp_low_import_cool");
+  } else if (outsideWarmer && d.season === "summer") {
+    targetMode = "exhaust_only";
+    reason.push("temp_low_exhaust_warm");
+  }
+}
+
+// update level/flowrate sync after temp priority
+if (USE_FLOW_RATE) {
+  targetLevel = flowRateToLevel(targetFlowRate);
+} else {
+  targetFlowRate = levelToFlowRate(targetLevel);
+}
+
+// ============================================================================
+// mode logic (season-based)
+// ============================================================================
+
+if (d.season === "summer") {
+  if (isNight && nightCoolingActive && outsideCooler && priority !== "temperatur runter") {
+    targetMode = "supply_only";
+    reason.push("mode_supply_night");
+  } else if (!isNight && outsideWarmer && tempAboveMax && priority !== "temperatur hoch") {
+    targetMode = "exhaust_only";
+    reason.push("mode_exhaust_day");
+  }
+}
+
+// ============================================================================
+// humidity bypass logic
+// ============================================================================
+
+if (priority === "feuchtigkeit hoch") {
+  const outsideMoreHumid = d.outdoorAbsHumidity > d.indoorAbsHumidity;
+  targetBypass = outsideMoreHumid ? 1 : 0;
+  reason.push(
+    outsideMoreHumid ? "bypass_open_import_humidity" : "bypass_closed_keep_humidity"
+  );
+}
+
+if (priority === "feuchtigkeit runter") {
+  const outsideDrier = d.outdoorAbsHumidity < d.indoorAbsHumidity;
+  targetBypass = outsideDrier ? 1 : 0;
+  reason.push(
+    outsideDrier ? "bypass_open_dehumidify" : "bypass_closed_outdoor_not_drier"
+  );
+}
+
+// ============================================================================
+// lautstärke priority (cap at level 3 / 225 flow)
+// ============================================================================
+
+if (priority === "lautstärke") {
+  if (USE_FLOW_RATE) {
+    if (targetFlowRate > 225) {
+      if (DEBUG) {
+        node.warn(`quiet mode: flow rate capped ${targetFlowRate} → 225`);
+      }
+      targetFlowRate = 225;
+      targetLevel = flowRateToLevel(targetFlowRate);
+    }
+  } else {
+    targetLevel = Math.min(targetLevel, 3);
+    targetFlowRate = levelToFlowRate(targetLevel);
+  }
+  reason.push("quiet_mode_cap");
+}
+
+// ============================================================================
+// apply maximum step limit (gradual changes)
+// ============================================================================
+
+if (USE_FLOW_RATE && !isEmergency) {
+  const beforeLimit = targetFlowRate;
+  targetFlowRate = applyMaxStepLimit(currentFlowRate, targetFlowRate, false);
+  
+  if (beforeLimit !== targetFlowRate) {
+    reason.push(`step_limited_${cfg.flowRate.maxStepPerCycle}`);
+  }
+  
+  targetLevel = flowRateToLevel(targetFlowRate);
+} else if (USE_FLOW_RATE && isEmergency) {
+  targetFlowRate = applyMaxStepLimit(currentFlowRate, targetFlowRate, true);
+  targetLevel = flowRateToLevel(targetFlowRate);
+}
+
+// ============================================================================
+// strict night limits (always applied last)
+// ============================================================================
+
+function applyNightLimits() {
+  if (!isNight) return;
+  
+  const nightMaxLvl = cfg.night.maxLevel;
+  const nightMaxFR = cfg.night.maxFlowRate;
+  
+  if (USE_FLOW_RATE) {
+    if (targetFlowRate > nightMaxFR) {
+      if (DEBUG) {
+        node.warn(`night limit: flow rate capped ${targetFlowRate} → ${nightMaxFR}`);
+      }
+      targetFlowRate = nightMaxFR;
+      targetLevel = flowRateToLevel(targetFlowRate);
+      reason.push(`night_cap_flowrate_${nightMaxFR}`);
+    }
+  } else {
+    if (targetLevel > nightMaxLvl) {
+      if (DEBUG) {
+        node.warn(`night limit: level capped ${targetLevel} → ${nightMaxLvl}`);
+      }
+      targetLevel = nightMaxLvl;
+      targetFlowRate = levelToFlowRate(targetLevel);
+      reason.push(`night_cap_level_${nightMaxLvl}`);
+    }
+  }
+}
+
+applyNightLimits();
+
+// final capping and sync
+if (USE_FLOW_RATE) {
+  targetFlowRate = capFlowRate(targetFlowRate);
+  targetLevel = flowRateToLevel(targetFlowRate);
+}
+
+const outputType = USE_FLOW_RATE
+  ? `flow rate=${targetFlowRate}`
+  : `level=${targetLevel}`;
+node.status({
+  fill: "blue",
+  shape: "dot",
+  text: `${outputType} | bypass=${targetBypass} | ${targetMode}`
+});
+
+if (DEBUG) {
+  node.warn(
+    `final decision: ${outputType} | ` +
+    `bypass=${targetBypass ? 'open' : 'closed'} | ` +
+    `mode=${targetMode}`
+  );
+}
+
+// ============================================================================
+// commands & persistence with change limiting
+// ============================================================================
+const applied = flow.get("maico.kwl_applied") || {};
+const cmds = [];
+function pushCmd(name, payload) {
+  cmds.push({topic: `${topicBase}/${name}/cmd`, payload});
+}
+// ============================================================================
+// ensure ventilation mode is "Nennlüftung" when using flow rate
+// ============================================================================
+if (USE_FLOW_RATE) {
+  const currentVentMode = d.currentFanLevel;
+  
+  if (currentVentMode !== 3) {
+    pushCmd("kwl_1_ventilation_mode", "Nennlüftung");
+    if (DEBUG) {
+      node.warn(
+        `flow rate mode active but ventilation mode is ${currentVentMode}, ` +
+        `switching to Nennlüftung (3) first`
+      );
+    }
+    reason.push("ventmode_correction_for_flowrate");
+    
+    // update applied state to prevent repeated sending
+    applied.level = 3;
+    applied.levelChangedAt = now;
+  }
+}
+// check if enough time has passed since last change
+function canChange(lastChangeKey, itemName) {
+  const lastChange = applied[lastChangeKey];
+  if (!lastChange) return true;
+  
+  const timeSince = now - lastChange;
+  if (timeSince >= minRuntimeMs) return true;
+  
+  const waitMinutes = Math.ceil((minRuntimeMs - timeSince) / 60000);
+  if (DEBUG) {
+    node.warn(
+      `${itemName} change blocked: last change ${Math.floor(timeSince / 60000)}min ago, ` +
+      `wait ${waitMinutes}min more`
+    );
+  }
+  reason.push(`${itemName.toLowerCase().replace(' ','_')}_wait_${waitMinutes}min`);
+  return false;
+}
+// ============================================================================
+// 1. ventilation mode or flow rate
+// ============================================================================
+if (USE_FLOW_RATE) {
+  // flow rate: can change every cycle (frequent adjustments allowed)
+  if (applied.flowRate !== targetFlowRate) {
+    applied.flowRate = targetFlowRate;
+    applied.flowRateChangedAt = now;
+    pushCmd("kwl_1_flow_rate_default", targetFlowRate);
+    if (DEBUG) {
+      node.warn(`✓ command: set flow rate → ${targetFlowRate}`);
+    }
+  } else if (DEBUG) {
+    node.warn(`○ flow rate unchanged: ${targetFlowRate}`);
+  }
+} else {
+  // ventilation level: limited by minRuntime
+  if (applied.level !== targetLevel) {
+    if (canChange("levelChangedAt", "ventilation level")) {
+      applied.level = targetLevel;
+      applied.levelChangedAt = now;
+      const nameMap = ["Feuchteschutz", "Reduziert", "Nennlüftung", "Intensiv"];
+      pushCmd("kwl_1_ventilation_mode", nameMap[targetLevel - 1]);
+      if (DEBUG) {
+        node.warn(`✓ command: set level → ${targetLevel} (${nameMap[targetLevel - 1]})`);
+      }
+    } else {
+      targetLevel = applied.level ?? 3;
+      if (DEBUG) {
+        node.warn(`○ level change blocked, keeping: ${targetLevel}`);
+      }
+    }
+  } else if (DEBUG) {
+    node.warn(`○ level unchanged: ${targetLevel}`);
+  }
+}
+
+// ============================================================================
+// 2. bypass (limited by minRuntime)
+// ============================================================================
+
+if (applied.bypass !== targetBypass) {
+  if (canChange("bypassChangedAt", "bypass")) {
+    applied.bypass = targetBypass;
+    applied.bypassChangedAt = now;
+    pushCmd("kwl_1_ventilation_bypass", targetBypass ? "on" : "off");
+    if (DEBUG) {
+      node.warn(`✓ command: set bypass → ${targetBypass ? 'on' : 'off'}`);
+    }
+  } else {
+    targetBypass = applied.bypass ?? 0;
+    if (DEBUG) {
+      node.warn(`○ bypass change blocked, keeping: ${targetBypass ? 'on' : 'off'}`);
+    }
+  }
+} else if (DEBUG) {
+  node.warn(`○ bypass unchanged: ${targetBypass ? 'on' : 'off'}`);
+}
+
+// ============================================================================
+// 3. operating mode (limited by minRuntime)
+// ============================================================================
+
+if (applied.mode !== targetMode) {
+  if (canChange("modeChangedAt", "operating mode")) {
+    applied.mode = targetMode;
+    applied.modeChangedAt = now;
+    const modeMap = {
+      balanced: "Manuell",
+      supply_only: "ECO-Zuluft",
+      exhaust_only: "ECO-Abluft"
+    };
+    pushCmd("kwl_1_operating_mode", modeMap[targetMode] || "Manuell");
+    if (DEBUG) {
+      node.warn(`✓ command: set mode → ${targetMode}`);
+    }
+  } else {
+    targetMode = applied.mode ?? "balanced";
+    if (DEBUG) {
+      node.warn(`○ mode change blocked, keeping: ${targetMode}`);
+    }
+  }
+} else if (DEBUG) {
+  node.warn(`○ mode unchanged: ${targetMode}`);
+}
+
+// save applied state
+flow.set("maico.kwl_applied", applied);
+
+// ============================================================================
+// debug status update
+// ============================================================================
+
+if (cmds.length === 0) {
+  node.status({fill: "yellow", shape: "ring", text: "no changes sent"});
+} else {
+  node.status({fill: "green", shape: "dot", text: `sent ${cmds.length} command(s)`});
+}
+
+// ============================================================================
+// prepare output payload
+// ============================================================================
+
+msg.payload = {
+  targetLevel: targetLevel,
+  targetFlowRate: targetFlowRate,
+  useFlowRate: USE_FLOW_RATE,
+  targetBypass: targetBypass,
+  targetMode: targetMode,
+  reason: reason,
+  co2Trend: co2Trend,
+  score: +score.toFixed(2),
+  priority: d.priority,
+  commands: cmds,
+  input: d,
+  applied: applied,
+  hysteresis: {
+    cooling: coolingActive,
+    dehumidify: dehumidifyActive,
+    nightCooling: nightCoolingActive
+  },
+  shower: {
+    active: showerActive,
+    boost: showerBoost,
+    bathroom1RH: d.bathroom1RH,
+    bathroom2RH: d.bathroom2RH
+  }
+};
+
+msg.settings = settings;
+msg.debug = "core_decision";
+
+return msg;
